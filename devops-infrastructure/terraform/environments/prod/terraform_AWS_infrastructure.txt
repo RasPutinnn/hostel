@@ -1,0 +1,626 @@
+# main.tf - Infraestrutura completa para Hostal MAGIC
+
+terraform {
+  required_version = ">= 1.0"
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+# Variables
+variable "environment" {
+  description = "Environment (staging/production)"
+  type        = string
+  default     = "staging"
+}
+
+variable "project_name" {
+  description = "Project name"
+  type        = string
+  default     = "hostal-magic"
+}
+
+variable "openai_api_key" {
+  description = "OpenAI API Key"
+  type        = string
+  sensitive   = true
+}
+
+variable "from_email" {
+  description = "SES verified email for notifications"
+  type        = string
+}
+
+# Data sources
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+# Locals
+locals {
+  account_id = data.aws_caller_identity.current.account_id
+  region     = data.aws_region.current.name
+  
+  tags = {
+    Environment = var.environment
+    Project     = var.project_name
+    ManagedBy   = "terraform"
+  }
+}
+
+# S3 Buckets
+resource "aws_s3_bucket" "data_lake" {
+  bucket = "${var.project_name}-data-lake-${var.environment}"
+  tags   = local.tags
+}
+
+resource "aws_s3_bucket_versioning" "data_lake" {
+  bucket = aws_s3_bucket.data_lake.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "data_lake" {
+  bucket = aws_s3_bucket.data_lake.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# DynamoDB Tables
+resource "aws_dynamodb_table" "reservas" {
+  name           = "${var.project_name}-reservas-${var.environment}"
+  billing_mode   = "PAY_PER_REQUEST"
+  hash_key       = "reserva_id"
+
+  attribute {
+    name = "reserva_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "cliente_email"
+    type = "S"
+  }
+
+  attribute {
+    name = "checkin"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "cliente-email-index"
+    hash_key        = "cliente_email"
+    projection_type = "ALL"
+  }
+
+  global_secondary_index {
+    name            = "checkin-index"
+    hash_key        = "checkin"
+    projection_type = "ALL"
+  }
+
+  tags = local.tags
+}
+
+resource "aws_dynamodb_table" "quartos" {
+  name         = "${var.project_name}-quartos-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "quarto_id"
+
+  attribute {
+    name = "quarto_id"
+    type = "S"
+  }
+
+  attribute {
+    name = "tipo"
+    type = "S"
+  }
+
+  global_secondary_index {
+    name            = "tipo-index"
+    hash_key        = "tipo"
+    projection_type = "ALL"
+  }
+
+  tags = local.tags
+}
+
+resource "aws_dynamodb_table" "clientes" {
+  name         = "${var.project_name}-clientes-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "email"
+
+  attribute {
+    name = "email"
+    type = "S"
+  }
+
+  tags = local.tags
+}
+
+resource "aws_dynamodb_table" "chatbot_sessions" {
+  name         = "${var.project_name}-chatbot-sessions-${var.environment}"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "sessionId"
+
+  attribute {
+    name = "sessionId"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  tags = local.tags
+}
+
+# SQS Queue for BI processing
+resource "aws_sqs_queue" "bi_queue" {
+  name                      = "${var.project_name}-bi-queue-${var.environment}"
+  delay_seconds             = 0
+  max_message_size          = 262144
+  message_retention_seconds = 1209600
+  visibility_timeout_seconds = 300
+
+  tags = local.tags
+}
+
+# IAM Roles and Policies
+resource "aws_iam_role" "lambda_execution_role" {
+  name = "${var.project_name}-lambda-execution-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      }
+    ]
+  })
+
+  tags = local.tags
+}
+
+resource "aws_iam_policy" "lambda_policy" {
+  name = "${var.project_name}-lambda-policy-${var.environment}"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "arn:aws:logs:${local.region}:${local.account_id}:*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "dynamodb:GetItem",
+          "dynamodb:PutItem",
+          "dynamodb:UpdateItem",
+          "dynamodb:DeleteItem",
+          "dynamodb:Query",
+          "dynamodb:Scan"
+        ]
+        Resource = [
+          aws_dynamodb_table.reservas.arn,
+          aws_dynamodb_table.quartos.arn,
+          aws_dynamodb_table.clientes.arn,
+          aws_dynamodb_table.chatbot_sessions.arn,
+          "${aws_dynamodb_table.reservas.arn}/index/*",
+          "${aws_dynamodb_table.quartos.arn}/index/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ses:SendEmail",
+          "ses:SendRawEmail"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sqs:SendMessage",
+          "sqs:ReceiveMessage",
+          "sqs:DeleteMessage"
+        ]
+        Resource = aws_sqs_queue.bi_queue.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject"
+        ]
+        Resource = "${aws_s3_bucket.data_lake.arn}/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "lambda_policy_attachment" {
+  role       = aws_iam_role.lambda_execution_role.name
+  policy_arn = aws_iam_policy.lambda_policy.arn
+}
+
+# Lambda Functions
+resource "aws_lambda_function" "reservas_handler" {
+  filename         = "reservas_handler.zip"
+  function_name    = "${var.project_name}-reservas-handler-${var.environment}"
+  role            = aws_iam_role.lambda_execution_role.arn
+  handler         = "lambda_function.lambda_handler"
+  runtime         = "python3.9"
+  timeout         = 30
+
+  environment {
+    variables = {
+      RESERVAS_TABLE      = aws_dynamodb_table.reservas.name
+      QUARTOS_TABLE       = aws_dynamodb_table.quartos.name
+      CLIENTES_TABLE      = aws_dynamodb_table.clientes.name
+      BI_QUEUE_URL        = aws_sqs_queue.bi_queue.url
+      FROM_EMAIL          = var.from_email
+      ENVIRONMENT         = var.environment
+    }
+  }
+
+  tags = local.tags
+}
+
+resource "aws_lambda_function" "chatbot_handler" {
+  filename         = "chatbot_handler.zip"
+  function_name    = "${var.project_name}-chatbot-handler-${var.environment}"
+  role            = aws_iam_role.lambda_execution_role.arn
+  handler         = "index.handler"
+  runtime         = "nodejs18.x"
+  timeout         = 30
+
+  environment {
+    variables = {
+      OPENAI_API_KEY      = var.openai_api_key
+      SESSIONS_TABLE      = aws_dynamodb_table.chatbot_sessions.name
+      RESERVAS_LAMBDA_ARN = aws_lambda_function.reservas_handler.arn
+      ENVIRONMENT         = var.environment
+    }
+  }
+
+  tags = local.tags
+}
+
+# API Gateway
+resource "aws_api_gateway_rest_api" "hostal_api" {
+  name        = "${var.project_name}-api-${var.environment}"
+  description = "API para Hostal MAGIC"
+
+  endpoint_configuration {
+    types = ["REGIONAL"]
+  }
+
+  tags = local.tags
+}
+
+# API Gateway - Reservas Resource
+resource "aws_api_gateway_resource" "reservas" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  parent_id   = aws_api_gateway_rest_api.hostal_api.root_resource_id
+  path_part   = "reservas"
+}
+
+resource "aws_api_gateway_method" "reservas_post" {
+  rest_api_id   = aws_api_gateway_rest_api.hostal_api.id
+  resource_id   = aws_api_gateway_resource.reservas.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "reservas_integration" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  resource_id = aws_api_gateway_resource.reservas.id
+  http_method = aws_api_gateway_method.reservas_post.http_method
+
+  integration_http_method = "POST"
+  type                   = "AWS_PROXY"
+  uri                    = aws_lambda_function.reservas_handler.invoke_arn
+}
+
+# API Gateway - Chatbot Resource
+resource "aws_api_gateway_resource" "chatbot" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  parent_id   = aws_api_gateway_rest_api.hostal_api.root_resource_id
+  path_part   = "chatbot"
+}
+
+resource "aws_api_gateway_method" "chatbot_post" {
+  rest_api_id   = aws_api_gateway_rest_api.hostal_api.id
+  resource_id   = aws_api_gateway_resource.chatbot.id
+  http_method   = "POST"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "chatbot_integration" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  resource_id = aws_api_gateway_resource.chatbot.id
+  http_method = aws_api_gateway_method.chatbot_post.http_method
+
+  integration_http_method = "POST"
+  type                   = "AWS_PROXY"
+  uri                    = aws_lambda_function.chatbot_handler.invoke_arn
+}
+
+# CORS for API Gateway
+resource "aws_api_gateway_method" "reservas_options" {
+  rest_api_id   = aws_api_gateway_rest_api.hostal_api.id
+  resource_id   = aws_api_gateway_resource.reservas.id
+  http_method   = "OPTIONS"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "reservas_options_integration" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  resource_id = aws_api_gateway_resource.reservas.id
+  http_method = aws_api_gateway_method.reservas_options.http_method
+  type        = "MOCK"
+
+  request_templates = {
+    "application/json" = "{\"statusCode\": 200}"
+  }
+}
+
+resource "aws_api_gateway_method_response" "reservas_options_response" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  resource_id = aws_api_gateway_resource.reservas.id
+  http_method = aws_api_gateway_method.reservas_options.http_method
+  status_code = "200"
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = true
+    "method.response.header.Access-Control-Allow-Methods" = true
+    "method.response.header.Access-Control-Allow-Origin"  = true
+  }
+}
+
+resource "aws_api_gateway_integration_response" "reservas_options_integration_response" {
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  resource_id = aws_api_gateway_resource.reservas.id
+  http_method = aws_api_gateway_method.reservas_options.http_method
+  status_code = aws_api_gateway_method_response.reservas_options_response.status_code
+
+  response_parameters = {
+    "method.response.header.Access-Control-Allow-Headers" = "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+    "method.response.header.Access-Control-Allow-Methods" = "'GET,OPTIONS,POST,PUT'"
+    "method.response.header.Access-Control-Allow-Origin"  = "'*'"
+  }
+}
+
+# API Gateway Deployment
+resource "aws_api_gateway_deployment" "hostal_api_deployment" {
+  depends_on = [
+    aws_api_gateway_integration.reservas_integration,
+    aws_api_gateway_integration.chatbot_integration
+  ]
+
+  rest_api_id = aws_api_gateway_rest_api.hostal_api.id
+  stage_name  = var.environment
+}
+
+# Lambda Permissions for API Gateway
+resource "aws_lambda_permission" "allow_api_gateway_reservas" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.reservas_handler.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.hostal_api.execution_arn}/*/*"
+}
+
+resource "aws_lambda_permission" "allow_api_gateway_chatbot" {
+  statement_id  = "AllowExecutionFromAPIGateway"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.chatbot_handler.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.hostal_api.execution_arn}/*/*"
+}
+
+# Glue Database and Crawler
+resource "aws_glue_catalog_database" "hostal_database" {
+  name = "${var.project_name}_database_${var.environment}"
+}
+
+resource "aws_iam_role" "glue_role" {
+  name = "${var.project_name}-glue-role-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "glue.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "glue_service_role" {
+  role       = aws_iam_role.glue_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole"
+}
+
+resource "aws_iam_policy" "glue_s3_policy" {
+  name = "${var.project_name}-glue-s3-policy-${var.environment}"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:DeleteObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          aws_s3_bucket.data_lake.arn,
+          "${aws_s3_bucket.data_lake.arn}/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "glue_s3_policy_attachment" {
+  role       = aws_iam_role.glue_role.name
+  policy_arn = aws_iam_policy.glue_s3_policy.arn
+}
+
+resource "aws_glue_crawler" "hostal_crawler" {
+  database_name = aws_glue_catalog_database.hostal_database.name
+  name          = "${var.project_name}-crawler-${var.environment}"
+  role          = aws_iam_role.glue_role.arn
+
+  s3_target {
+    path = "s3://${aws_s3_bucket.data_lake.bucket}/data/"
+  }
+
+  tags = local.tags
+}
+
+# Step Functions
+resource "aws_iam_role" "step_functions_role" {
+  name = "${var.project_name}-step-functions-role-${var.environment}"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "states.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_iam_policy" "step_functions_policy" {
+  name = "${var.project_name}-step-functions-policy-${var.environment}"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "lambda:InvokeFunction"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject"
+        ]
+        Resource = "${aws_s3_bucket.data_lake.arn}/*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "glue:StartCrawler",
+          "glue:GetCrawler"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "sagemaker:CreateTransformJob",
+          "sagemaker:DescribeTransformJob"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "comprehend:BatchDetectSentiment"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "step_functions_policy_attachment" {
+  role       = aws_iam_role.step_functions_role.name
+  policy_arn = aws_iam_policy.step_functions_policy.arn
+}
+
+# EventBridge para executar Step Functions
+resource "aws_cloudwatch_event_rule" "daily_pipeline" {
+  name                = "${var.project_name}-daily-pipeline-${var.environment}"
+  description         = "Trigger daily BI/ML pipeline"
+  schedule_expression = "cron(0 6 * * ? *)"  # 6 AM daily
+  
+  tags = local.tags
+}
+
+# Outputs
+output "api_gateway_url" {
+  description = "API Gateway URL"
+  value       = aws_api_gateway_deployment.hostal_api_deployment.invoke_url
+}
+
+output "reservas_endpoint" {
+  description = "Reservas endpoint"
+  value       = "${aws_api_gateway_deployment.hostal_api_deployment.invoke_url}/reservas"
+}
+
+output "chatbot_endpoint" {
+  description = "Chatbot endpoint"
+  value       = "${aws_api_gateway_deployment.hostal_api_deployment.invoke_url}/chatbot"
+}
+
+output "data_lake_bucket" {
+  description = "Data Lake S3 bucket name"
+  value       = aws_s3_bucket.data_lake.bucket
+}
+
+output "dynamodb_tables" {
+  description = "DynamoDB table names"
+  value = {
+    reservas = aws_dynamodb_table.reservas.name
+    quartos  = aws_dynamodb_table.quartos.name
+    clientes = aws_dynamodb_table.clientes.name
+    sessions = aws_dynamodb_table.chatbot_sessions.name
+  }
+}

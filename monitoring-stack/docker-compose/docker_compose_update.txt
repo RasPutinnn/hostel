@@ -1,0 +1,91 @@
+# ADICIONAR estas configurações ao seu docker-compose.yml existente
+
+version: '3.8'
+
+services:
+  # Seus serviços existentes...
+  
+  # NOVO SERVIÇO - OTA Integration
+  ota-integration:
+    build: 
+      context: ./services/ota-integration-service
+      dockerfile: Dockerfile
+    ports:
+      - "3003:3003"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - PORT=3003
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - BOOKING_API_KEY=${BOOKING_API_KEY}
+      - BOOKING_USERNAME=${BOOKING_USERNAME}
+      - BOOKING_PASSWORD=${BOOKING_PASSWORD}
+      - BOOKING_HOTEL_ID=${BOOKING_HOTEL_ID}
+      - BOOKING_WEBHOOK_SECRET=${BOOKING_WEBHOOK_SECRET}
+      - HOSTELWORLD_API_KEY=${HOSTELWORLD_API_KEY}
+      - HOSTELWORLD_API_SECRET=${HOSTELWORLD_API_SECRET}
+      - HOSTELWORLD_PROPERTY_ID=${HOSTELWORLD_PROPERTY_ID}
+      - HOSTELWORLD_WEBHOOK_SECRET=${HOSTELWORLD_WEBHOOK_SECRET}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - OPERATIONS_API_URL=http://operations-service:3001
+      - BOOKING_SERVICE_URL=http://booking-service:3000
+    depends_on:
+      - redis
+      - postgres
+    volumes:
+      - ./services/ota-integration-service/logs:/app/logs
+    networks:
+      - hostel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # NOVO SERVIÇO - Redis (se não existir)
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+      - ./infrastructure/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    networks:
+      - hostel-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
+
+  # NOVO SERVIÇO - Redis Commander (opcional - para gerenciar Redis)
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+      - HTTP_USER=${REDIS_COMMANDER_USER:-admin}
+      - HTTP_PASSWORD=${REDIS_COMMANDER_PASSWORD:-admin123}
+    ports:
+      - "8081:8081"
+    depends_on:
+      - redis
+    networks:
+      - hostel-network
+    restart: unless-stopped
+
+# ADICIONAR aos volumes existentes
+volumes:
+  redis_data:
+    driver: local
+
+# Certificar-se de que a rede existe
+networks:
+  hostel-network:
+    driver: bridge

@@ -1,0 +1,292 @@
+{
+  "Comment": "Pipeline de Inteligência Artificial e Business Intelligence para Hostal MAGIC",
+  "StartAt": "ValidarDados",
+  "States": {
+    "ValidarDados": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${ValidarDadosLambdaArn}",
+        "Payload.$": "$"
+      },
+      "Next": "ProcessarDados",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "TratarErro",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+    
+    "ProcessarDados": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "AtualizarDataLake",
+          "States": {
+            "AtualizarDataLake": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+              "Parameters": {
+                "Bucket": "${DataLakeBucket}",
+                "Key.$": "$.data_key",
+                "Body.$": "$.processed_data"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ExecutarGlueCrawler",
+          "States": {
+            "ExecutarGlueCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:startCrawler",
+              "Parameters": {
+                "Name": "${GlueCrawlerName}"
+              },
+              "Next": "AguardarCrawler"
+            },
+            "AguardarCrawler": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:glue:getCrawler",
+              "Parameters": {
+                "Name": "${GlueCrawlerName}"
+              },
+              "Next": "VerificarStatusCrawler"
+            },
+            "VerificarStatusCrawler": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Crawler.State",
+                  "StringEquals": "RUNNING",
+                  "Next": "EsperarCrawler"
+                },
+                {
+                  "Variable": "$.Crawler.State",
+                  "StringEquals": "READY",
+                  "Next": "CrawlerConcluido"
+                }
+              ],
+              "Default": "TratarErroCrawler"
+            },
+            "EsperarCrawler": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "AguardarCrawler"
+            },
+            "CrawlerConcluido": {
+              "Type": "Pass",
+              "Result": "Crawler executado com sucesso",
+              "End": true
+            },
+            "TratarErroCrawler": {
+              "Type": "Fail",
+              "Cause": "Erro no Glue Crawler"
+            }
+          }
+        }
+      ],
+      "Next": "ExecutarModelosML"
+    },
+    
+    "ExecutarModelosML": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "ModeloPrevisaoDemanda",
+          "States": {
+            "ModeloPrevisaoDemanda": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sagemaker:createTransformJob.sync",
+              "Parameters": {
+                "TransformJobName.$": "$.transform_job_name_demanda",
+                "ModelName": "${ModeloPrevisaoDemandaName}",
+                "TransformInput": {
+                  "DataSource": {
+                    "S3DataSource": {
+                      "S3DataType": "S3Prefix",
+                      "S3Uri.$": "$.input_data_uri"
+                    }
+                  },
+                  "ContentType": "text/csv"
+                },
+                "TransformOutput": {
+                  "S3OutputPath.$": "$.output_demanda_uri"
+                },
+                "TransformResources": {
+                  "InstanceType": "ml.m5.large",
+                  "InstanceCount": 1
+                }
+              },
+              "End": true,
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ErroModeloDemanda"
+                }
+              ]
+            },
+            "ErroModeloDemanda": {
+              "Type": "Pass",
+              "Result": "Erro no modelo de previsão de demanda",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ModeloRecomendacao",
+          "States": {
+            "ModeloRecomendacao": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ModeloRecomendacaoLambdaArn}",
+                "Payload": {
+                  "action": "gerar_recomendacoes",
+                  "input_data.$": "$.customer_data"
+                }
+              },
+              "End": true,
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ErroModeloRecomendacao"
+                }
+              ]
+            },
+            "ErroModeloRecomendacao": {
+              "Type": "Pass",
+              "Result": "Erro no modelo de recomendação",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "AnalisesSentimento",
+          "States": {
+            "AnalisesSentimento": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:comprehend:batchDetectSentiment",
+              "Parameters": {
+                "LanguageCode": "pt",
+                "TextList.$": "$.reviews_text"
+              },
+              "Next": "ProcessarResultadosSentimento",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "ErroAnalisesSentimento"
+                }
+              ]
+            },
+            "ProcessarResultadosSentimento": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ProcessarSentimentoLambdaArn}",
+                "Payload": {
+                  "sentiment_results.$": "$.ResultList",
+                  "original_reviews.$": "$.original_reviews"
+                }
+              },
+              "End": true
+            },
+            "ErroAnalisesSentimento": {
+              "Type": "Pass",
+              "Result": "Erro na análise de sentimento",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "GerarRelatorios"
+    },
+    
+    "GerarRelatorios": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${GerarRelatoriosLambdaArn}",
+        "Payload": {
+          "ml_results.$": "$",
+          "timestamp.$": "$.State.EnteredTime"
+        }
+      },
+      "Next": "AtualizarDashboards"
+    },
+    
+    "AtualizarDashboards": {
+      "Type": "Parallel",
+      "Branches": [
+        {
+          "StartAt": "AtualizarQuickSight",
+          "States": {
+            "AtualizarQuickSight": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AtualizarQuickSightLambdaArn}",
+                "Payload": {
+                  "dashboard_ids": ["${DashboardOcupacao}", "${DashboardReceita}", "${DashboardClientes}"],
+                  "refresh_type": "full"
+                }
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "NotificarGestores",
+          "States": {
+            "NotificarGestores": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${NotificarGestoresLambdaArn}",
+                "Payload": {
+                  "insights.$": "$.insights",
+                  "alertas.$": "$.alertas",
+                  "metricas.$": "$.metricas"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "SucessoPipeline"
+    },
+    
+    "SucessoPipeline": {
+      "Type": "Pass",
+      "Result": {
+        "status": "success",
+        "message": "Pipeline de IA/BI executado com sucesso",
+        "timestamp.$": "$.State.EnteredTime"
+      },
+      "End": true
+    },
+    
+    "TratarErro": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${TratarErroLambdaArn}",
+        "Payload": {
+          "error.$": "$.error",
+          "input.$": "$.input",
+          "timestamp.$": "$.State.EnteredTime"
+        }
+      },
+      "Next": "FalhaPipeline"
+    },
+    
+    "FalhaPipeline": {
+      "Type": "Fail",
+      "Cause": "Erro crítico no pipeline de IA/BI"
+    }
+  }
+}

@@ -1,0 +1,60 @@
+{
+  "name": "ota-integration-service",
+  "version": "1.0.0",
+  "description": "OTA Integration Service for Hostel Management - Booking.com & HostelWorld",
+  "main": "src/app.js",
+  "scripts": {
+    "start": "node src/app.js",
+    "dev": "nodemon src/app.js",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "lint": "eslint src/",
+    "lint:fix": "eslint src/ --fix",
+    "build": "echo 'No build step required'",
+    "healthcheck": "curl -f http://localhost:3003/health || exit 1"
+  },
+  "keywords": [
+    "ota",
+    "booking",
+    "hostelworld",
+    "hotel",
+    "hostel",
+    "integration",
+    "api",
+    "devops"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "express-rate-limit": "^6.7.0",
+    "axios": "^1.4.0",
+    "bull": "^4.10.4",
+    "redis": "^4.6.7",
+    "winston": "^3.9.0",
+    "joi": "^17.9.2",
+    "dotenv": "^16.1.4",
+    "crypto": "^1.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22",
+    "jest": "^29.5.0",
+    "supertest": "^6.3.3",
+    "eslint": "^8.43.0",
+    "@types/jest": "^29.5.2"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RasPutinnn/hostel-business-strategy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RasPutinnn/hostel-business-strategy/issues"
+  }
+}
